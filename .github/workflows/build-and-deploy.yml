@@ -1,0 +1,74 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'pom.xml'
+      - 'Dockerfile'
+      - 'deploy/**'
+      - '.github/workflows/build-and-deploy.yml'
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # OIDC federation - no long-lived AWS keys stored in GitHub.
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image
+        id: build-image
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" -t "$REGISTRY/$ECR_REPOSITORY:latest" .
+          docker push "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker push "$REGISTRY/$ECR_REPOSITORY:latest"
+
+      - name: Render ECS task definition
+        env:
+          ECS_EXECUTION_ROLE_ARN: ${{ vars.ECS_EXECUTION_ROLE_ARN }}
+          ECS_TASK_ROLE_ARN: ${{ vars.ECS_TASK_ROLE_ARN }}
+          RDS_PROXY_ENDPOINT: ${{ vars.RDS_PROXY_ENDPOINT }}
+          DB_NAME: ${{ vars.DB_NAME }}
+          REDIS_HOST: ${{ vars.REDIS_HOST }}
+          REDIS_PORT: ${{ vars.REDIS_PORT }}
+          DB_SECRET_ARN: ${{ vars.DB_SECRET_ARN }}
+          LOG_GROUP: ${{ vars.LOG_GROUP }}
+        run: |
+          envsubst '${ECS_EXECUTION_ROLE_ARN} ${ECS_TASK_ROLE_ARN} ${RDS_PROXY_ENDPOINT} ${DB_NAME} ${REDIS_HOST} ${REDIS_PORT} ${DB_SECRET_ARN} ${LOG_GROUP} ${AWS_REGION}' \
+            < deploy/taskdef.template.json > deploy/taskdef.json
+          cp deploy/appspec.template.yaml deploy/appspec.yaml
+
+      - name: Bundle deploy artifacts and upload to the pipeline artifact bucket
+        env:
+          ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET }}
+        run: |
+          cd deploy
+          zip taskdef-bundle.zip taskdef.json appspec.yaml
+          aws s3 cp taskdef-bundle.zip "s3://$ARTIFACT_BUCKET/deploy/taskdef-bundle.zip"
+
+      # Pushing the image above also fires the EventBridge rule that starts
+      # CodePipeline -> CodeDeploy blue/green deployment to ECS.

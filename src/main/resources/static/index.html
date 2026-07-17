@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover" />
+  <title>To-Do</title>
+  <link rel="stylesheet" href="style.css" />
+  <script>
+    // Applied before paint so a stored choice doesn't flash the wrong theme.
+    var storedTheme = localStorage.getItem('theme');
+    if (storedTheme) document.documentElement.setAttribute('data-theme', storedTheme);
+  </script>
+</head>
+<body>
+  <nav class="nav">
+    <span class="nav-mark">✦</span>
+    <span class="nav-title">To-Do</span>
+    <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Toggle dark mode"></button>
+  </nav>
+
+  <main class="container">
+    <section class="hero">
+      <p class="eyebrow">Today</p>
+      <h1>What needs doing</h1>
+      <p class="body-text">
+        Writes go straight to Postgres through RDS Proxy. Reads are served
+        from Redis for 30 seconds before falling back to the database
+        <sup>1</sup>.
+      </p>
+    </section>
+
+    <form id="task-form" class="task-form">
+      <input id="title" type="text" placeholder="Task title" required maxlength="200" />
+      <input id="description" type="text" placeholder="Description (optional)" maxlength="500" />
+      <button type="submit">Add</button>
+    </form>
+
+    <section class="section">
+      <h2>Tasks</h2>
+      <p id="task-count" class="page-descriptor"></p>
+      <ul id="task-list" class="task-list"></ul>
+      <p id="empty-state" class="empty-state" hidden>Nothing here yet — add your first task above.</p>
+    </section>
+
+    <aside class="footnote">
+      <sup>1</sup> the cache is invalidated on every create, update, and delete.
+    </aside>
+  </main>
+
+  <footer class="footer">
+    <p class="footer-copy">To-Do — ECS Fargate · RDS Proxy · ElastiCache Redis</p>
+    <p class="footer-meta">Deployed via CloudFormation, blue/green through CodeDeploy</p>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
