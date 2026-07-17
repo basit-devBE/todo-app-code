@@ -3,72 +3,89 @@ name: Build and Deploy
 on:
   push:
     branches: [main]
-    paths:
-      - 'src/**'
-      - 'pom.xml'
-      - 'Dockerfile'
-      - 'deploy/**'
-      - '.github/workflows/build-and-deploy.yml'
-  workflow_dispatch: {}
 
 permissions:
   id-token: write
   contents: read
 
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
 env:
-  AWS_REGION: ${{ vars.AWS_REGION }}
-  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+  AWS_REGION: eu-central-1
+  AWS_ACCOUNT_ID: '124355645722'
+  ECR_REPOSITORY: todo-app
+  ARTIFACT_BUCKET: todo-app-cicd-artifacts-124355645722
+  ECS_TASK_DEFINITION_FAMILY: todo-app-task
+  CONTAINER_NAME: app
 
 jobs:
-  build-and-push:
+  build-and-deploy:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # OIDC federation - no long-lived AWS keys stored in GitHub.
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/todo-app-github-actions
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build, tag, and push image
-        id: build-image
+      # The git SHA tag is the immutable, traceable reference to this exact
+      # build. "latest" is pushed separately, purely as the fixed pointer tag
+      # that CodePipeline's ECR source action and the EventBridge rule watch
+      # (that mechanism requires one stable tag name - it isn't SHA-aware).
+      - name: Build image
         env:
-          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
-          IMAGE_TAG: ${{ github.sha }}
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
         run: |
-          docker build -t "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" -t "$REGISTRY/$ECR_REPOSITORY:latest" .
-          docker push "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
-          docker push "$REGISTRY/$ECR_REPOSITORY:latest"
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }} .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }} $ECR_REGISTRY/$ECR_REPOSITORY:latest
 
-      - name: Render ECS task definition
+      - name: Push immutable sha-tagged image
         env:
-          ECS_EXECUTION_ROLE_ARN: ${{ vars.ECS_EXECUTION_ROLE_ARN }}
-          ECS_TASK_ROLE_ARN: ${{ vars.ECS_TASK_ROLE_ARN }}
-          RDS_PROXY_ENDPOINT: ${{ vars.RDS_PROXY_ENDPOINT }}
-          DB_NAME: ${{ vars.DB_NAME }}
-          REDIS_HOST: ${{ vars.REDIS_HOST }}
-          REDIS_PORT: ${{ vars.REDIS_PORT }}
-          DB_SECRET_ARN: ${{ vars.DB_SECRET_ARN }}
-          LOG_GROUP: ${{ vars.LOG_GROUP }}
-        run: |
-          envsubst '${ECS_EXECUTION_ROLE_ARN} ${ECS_TASK_ROLE_ARN} ${RDS_PROXY_ENDPOINT} ${DB_NAME} ${REDIS_HOST} ${REDIS_PORT} ${DB_SECRET_ARN} ${LOG_GROUP} ${AWS_REGION}' \
-            < deploy/taskdef.template.json > deploy/taskdef.json
-          cp deploy/appspec.template.yaml deploy/appspec.yaml
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
 
-      - name: Bundle deploy artifacts and upload to the pipeline artifact bucket
+      # Derive taskdef.json from whatever task definition is actually live
+      # right now (created by CloudFormation initially, or by a previous
+      # deploy after that) so real values (RDS Proxy endpoint, DB secret
+      # ARN, Redis host/port) are always correct - only the image
+      # placeholder changes here. CodePipeline substitutes <IMAGE1_NAME>
+      # with the resolved digest of whatever's pushed to :latest below.
+      - name: Prepare deploy bundle
+        run: |
+          mkdir -p deploy-bundle
+          cp deploy/appspec.yaml deploy-bundle/appspec.yaml
+
+          aws ecs describe-task-definition \
+            --task-definition "$ECS_TASK_DEFINITION_FAMILY" \
+            --query 'taskDefinition' > raw-taskdef.json
+
+          jq --arg name "$CONTAINER_NAME" '
+            .containerDefinitions = [
+              .containerDefinitions[] |
+              if .name == $name then .image = "<IMAGE1_NAME>" else . end
+            ] |
+            del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                .compatibilities, .registeredAt, .registeredBy)
+          ' raw-taskdef.json > deploy-bundle/taskdef.json
+
+          cd deploy-bundle
+          zip -r ../deploy-bundle.zip appspec.yaml taskdef.json
+
+      - name: Upload deploy bundle to S3
+        run: aws s3 cp deploy-bundle.zip "s3://$ARTIFACT_BUCKET/deploy/deploy-bundle.zip"
+
+      # Pushed last and deliberately: EventBridge/CodePipeline only trigger
+      # off this tag, and by now the sha image + deploy bundle already exist.
+      - name: Push latest tag (triggers the deployment pipeline)
         env:
-          ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET }}
-        run: |
-          cd deploy
-          zip taskdef-bundle.zip taskdef.json appspec.yaml
-          aws s3 cp taskdef-bundle.zip "s3://$ARTIFACT_BUCKET/deploy/taskdef-bundle.zip"
-
-      # Pushing the image above also fires the EventBridge rule that starts
-      # CodePipeline -> CodeDeploy blue/green deployment to ECS.
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest

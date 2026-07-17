@@ -49,21 +49,27 @@ docker run -p 8080:8080 \
 
 ## CI/CD
 
-`.github/workflows/build-and-deploy.yml` runs on every push to `main` that touches `src/`,
-`pom.xml`, `Dockerfile`, or `deploy/`:
+`.github/workflows/build-and-deploy.yml` runs on every push to `main`:
 
-1. Assumes an AWS IAM role via **GitHub OIDC** (`aws-actions/configure-aws-credentials`,
-   `id-token: write` permission) — no long-lived AWS keys are stored in GitHub.
-2. Builds the Docker image and pushes `:latest` and `:<commit-sha>` to ECR.
-3. Renders `deploy/taskdef.template.json` + `deploy/appspec.template.yaml` with the account's
-   role ARNs / endpoints (from repo variables — see the infra repo's README for the mapping)
-   and zips them into `deploy/taskdef-bundle.zip`.
-4. Uploads that bundle to the CodePipeline artifact S3 bucket.
+1. Assumes `todo-app-github-actions` via **GitHub OIDC** (`aws-actions/configure-aws-credentials`,
+   `id-token: write` permission) — no long-lived AWS keys are stored in GitHub. That role is
+   created by the infra repo's `stacks/iam.yaml`, scoped to this exact repo/branch.
+2. Builds the image and pushes it to ECR tagged with the commit SHA (immutable, traceable).
+3. Calls `aws ecs describe-task-definition` on the **live** `todo-app-task` definition — the one
+   CloudFormation created/updated with the real RDS Proxy endpoint, DB secret ARN, and Redis
+   host/port already baked in — strips the fields ECS doesn't accept on re-registration, and
+   patches only the `app` container's `image` field to the placeholder `<IMAGE1_NAME>`.
+4. Zips that patched `taskdef.json` with the static `deploy/appspec.yaml` and uploads it to the
+   CodePipeline artifact bucket at `deploy/deploy-bundle.zip`.
+5. Pushes the `:latest` tag last, deliberately — CodePipeline's ECR source action and the
+   EventBridge rule that starts the pipeline both watch that fixed tag, and by the time it's
+   pushed the SHA-tagged image and the deploy bundle already exist in place.
 
-The ECR push itself fires an EventBridge rule (defined in the infra repo) that starts
-CodePipeline, which runs a CodeDeploy **blue/green** deployment to ECS using the uploaded
-task definition + appspec.
+CodePipeline then runs a CodeDeploy **blue/green** deployment: the new task definition is
+registered with `<IMAGE1_NAME>` replaced by the resolved image digest, traffic shifts from the
+blue target group to green via the ALB's test listener, and the old tasks are torn down after a
+5-minute bake time.
 
-Before the workflow can succeed, set the repository variables listed in the infra repo's
-README (`AWS_DEPLOY_ROLE_ARN`, `ECR_REPOSITORY`, `ARTIFACT_BUCKET`, etc.) under
-**Settings → Secrets and variables → Actions → Variables**.
+No GitHub repository variables to configure — the account ID, region, ECR repo, artifact
+bucket, and role name are fixed values in the workflow itself (see the `env:` block), since
+this repo is scoped to one specific AWS account by design.
