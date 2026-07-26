@@ -37,21 +37,10 @@ jobs:
         id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      # The git SHA tag is the immutable, traceable reference to this exact
-      # build. "latest" is pushed separately, purely as the fixed pointer tag
-      # that CodePipeline's ECR source action and the EventBridge rule watch
-      # (that mechanism requires one stable tag name - it isn't SHA-aware).
       - name: Build image
         env:
           ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
-        run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }} .
-          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }} $ECR_REGISTRY/$ECR_REPOSITORY:latest
-
-      - name: Push immutable sha-tagged image
-        env:
-          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
-        run: docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
+        run: docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
 
       # Derive taskdef.json from whatever task definition is actually live
       # right now (created by CloudFormation initially, or by a previous
@@ -83,8 +72,9 @@ jobs:
       - name: Upload deploy bundle to S3
         run: aws s3 cp deploy-bundle.zip "s3://$ARTIFACT_BUCKET/deploy/deploy-bundle.zip"
 
-      # Pushed last and deliberately: EventBridge/CodePipeline only trigger
-      # off this tag, and by now the sha image + deploy bundle already exist.
+      # Pushed after the deploy bundle is already in S3, deliberately:
+      # EventBridge/CodePipeline trigger off this push, and the bundle needs
+      # to already be there by the time that happens.
       - name: Push latest tag (triggers the deployment pipeline)
         env:
           ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
