@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  AWS_REGION: eu-central-1
+  AWS_REGION: ${{ vars.AWS_REGION }}
   AWS_ACCOUNT_ID: '124355645722'
   ECR_REPOSITORY: todo-app
   ARTIFACT_BUCKET: todo-app-cicd-artifacts-124355645722
